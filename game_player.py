@@ -7,8 +7,7 @@ from ..core.position import parse_fen
 from ..core.moves import generate_legal_moves, make_move, is_game_over
 from ..core.constants import start_position
 from .selfplay import position_to_tensor, position_to_fen_board
-from .config import INSUFFICIENT_MATERIAL_CHECK_INTERVAL
-# from .training_logger import get_logger
+from .config import INSUFFICIENT_MATERIAL_CHECK_INTERVAL, NUM_WORKERS
 
 class GamePlayer:
     """게임 플레이어 클래스"""
@@ -46,9 +45,6 @@ def play_game(worker_id, game_id, models, game_config, gui_queue=None):
     device = game_config['device']
     mode = game_config['mode']
     
-    # 게임 시작 시간 기록
-    game_start_time = time.time()
-    
     # 게임 초기화
     pos = parse_fen(start_position)
     move_count = 0
@@ -72,7 +68,7 @@ def play_game(worker_id, game_id, models, game_config, gui_queue=None):
     
     # GUI 초기 상태 업데이트
     if gui_queue:
-        board_idx = worker_id % 64  # 64개 보드 사용
+        board_idx = worker_id % NUM_WORKERS
         gui_queue.put({'type': 'fen', 'fen': start_position, 'board_id': board_idx})
     
     # 게임 루프
@@ -122,12 +118,7 @@ def play_game(worker_id, game_id, models, game_config, gui_queue=None):
             mcts = game_config.get('mcts_instance')
             if mcts is None:
                 from .config import MCTS_C_PUCT
-                # 큐와 함께 MCTS 인스턴스 생성
-                mcts = MCTS(
-                    inference_queue=game_config['request_q'],
-                    result_queue=game_config['response_q'],
-                    c_puct=MCTS_C_PUCT
-                )
+                mcts = MCTS(c_puct=MCTS_C_PUCT)
             
             # 온도 적응적 설정 (AlphaZero 방식)
             if move_count < MCTS_TEMPERATURE_THRESHOLD:
@@ -136,7 +127,7 @@ def play_game(worker_id, game_id, models, game_config, gui_queue=None):
                 temp = MCTS_TEMPERATURE_LATE   # 후기: 최적 플레이
             
             try:
-                # 새로운 배치 방식 사용 (100개 → 1개 메시지)
+                # 간단한 배치 누적 방식 사용
                 move, policy_target = mcts.search_simple_batch(
                     pos, 
                     generate_legal_moves, 
@@ -165,16 +156,12 @@ def play_game(worker_id, game_id, models, game_config, gui_queue=None):
             from .config import EVAL_MCTS_SIMULATIONS
             
             # 평가용 MCTS 인스턴스 생성 (셀프플레이와 동일한 설정)
-            mcts = MCTS(
-                inference_queue=game_config['request_q'],
-                result_queue=game_config['response_q'],
-                c_puct=1.25
-            )
+            mcts = MCTS(c_puct=1.25)  # 평가 시 동일한 c_puct
             
             try:
-                # MCTS 탐색 (평가용 설정 - 새로운 배치 방식)
-                print(f"Worker {worker_id}: Starting MCTS batch evaluation with {EVAL_MCTS_SIMULATIONS} simulations")
-                move, _ = mcts.search_simple_batch(
+                # MCTS 탐색 (평가용 설정 - AlphaZero 논문 기준 완전 결정론적)
+                print(f"Worker {worker_id}: Starting MCTS evaluation with {EVAL_MCTS_SIMULATIONS} simulations")
+                move, _ = mcts.search(
                     pos, 
                     generate_legal_moves, 
                     EVAL_MCTS_SIMULATIONS,  # 평가용 시뮬레이션 수
@@ -186,7 +173,7 @@ def play_game(worker_id, game_id, models, game_config, gui_queue=None):
                     temperature=game_config.get('temperature', 0.0),  # 평가 시 온도 0
                     add_dirichlet_noise=game_config.get('dirichlet_noise', False)  # 평가 시 노이즈 비활성화
                 )
-                print(f"Worker {worker_id}: MCTS batch evaluation completed, selected move: {move}")
+                print(f"Worker {worker_id}: MCTS evaluation completed, selected move: {move}")
                 
             except Exception as e:
                 print(f"Worker {worker_id}: MCTS search failed in evaluation: {e}")
@@ -237,7 +224,7 @@ def play_game(worker_id, game_id, models, game_config, gui_queue=None):
         # GUI 업데이트
         if gui_queue:
             fen_board = position_to_fen_board(pos)
-            board_idx = worker_id % 64  # 64개 보드 사용
+            board_idx = worker_id % NUM_WORKERS
             gui_queue.put({'type': 'fen', 'fen': f"{fen_board} {'w' if pos.side == 0 else 'b'} - - 0 1", 'board_id': board_idx})
         
         # 수 제한 확인
@@ -262,41 +249,14 @@ def play_game(worker_id, game_id, models, game_config, gui_queue=None):
                 break
     
     # 결과 반환
-    game_time = time.time() - game_start_time
-    
     if mode == 'evaluate':
         return {
             'game_id': game_id,
             'winner': winner,
             'new_model_color': new_model_color,
-            'move_count': move_count,
-            'game_time': game_time
+            'move_count': move_count
         }
     else:
-        # 게임 통계 로깅 (비활성화)
-        # logger = get_logger()
-        current_iteration = game_config.get('iteration', 0)
-        
-        # 게임 종료 이유 분석
-        end_reason = 'completed'
-        if game_result is not None:
-            if move_count > game_config.get('max_moves', 200):
-                end_reason = 'max_moves'
-            elif game_result == 0.0:
-                end_reason = 'draw'
-            else:
-                end_reason = 'checkmate'
-        
-        # logger.log_game_result(
-        #     iteration=current_iteration,
-        #     game_id=game_id,
-        #     worker_id=worker_id,
-        #     result=game_result if game_result is not None else 0.0,
-        #     move_count=move_count,
-        #     game_time=game_time,
-        #     end_reason=end_reason
-        # )
-        
         # 셀프플레이 모드: 훈련 데이터 저장
         if history is not None and game_result is not None:
             from datetime import datetime
